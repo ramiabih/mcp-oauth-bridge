@@ -1,199 +1,126 @@
-# MCP OAuth Bridge 🌉
+# MCP OAuth Bridge
 
 **Bridge OAuth-based MCP servers to headless environments**
 
+[![CI](https://github.com/ramiabih/mcp-oauth-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/ramiabih/mcp-oauth-bridge/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/mcp-oauth-bridge.svg)](https://www.npmjs.com/package/mcp-oauth-bridge)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## Problem
 
-Many MCP servers (Model Context Protocol) use OAuth 2.0 browser-based authentication, which doesn't work on:
-- Headless VPS servers
-- Docker containers
-- CI/CD pipelines
-- Remote development environments
-
-This means you can't use MCP servers like Granola, Clarify, Linear, or Notion with tools like OpenClaw running on a remote server.
+Many MCP servers use OAuth 2.0 browser-based authentication, which breaks on headless environments — VPS servers, Docker containers, CI/CD pipelines. You can't complete a browser redirect on a machine without a browser.
 
 ## Solution
 
-MCP OAuth Bridge runs on your local machine (where browser OAuth works) and provides a simple HTTP API for headless clients to access OAuth-based MCP servers.
+Authenticate once on your local machine (where a browser exists), then run the bridge anywhere. Tokens are deployed to the remote server and auto-refreshed from there.
 
 ```
-Remote Server → MCP OAuth Bridge (local) → OAuth MCP Servers
-                        ↓
-                Browser OAuth works here!
+Local machine  →  mcp-oauth-bridge auth <server>  →  browser OAuth
+                                                          ↓
+VPS            ←  ~/.mcp-bridge/tokens/            ←  token saved
 ```
-
-## Features
-
-- ✅ **Universal**: Works with ANY OAuth-based MCP server
-- ✅ **Simple HTTP API**: Easy integration with any MCP client
-- ✅ **Token caching**: OAuth tokens cached securely
-- ✅ **Multi-server**: Support multiple MCP servers simultaneously
-- ✅ **Secure**: Password/token authentication for API access
-- ✅ **Docker support**: Run in container if needed
-- ✅ **Open source**: MIT licensed
 
 ## Quick Start
 
-### 1. Install
-
-\`\`\`bash
+```bash
 npm install -g mcp-oauth-bridge
-\`\`\`
+```
 
-### 2. Configure
-
-\`\`\`bash
+**1. Initialize**
+```bash
 mcp-oauth-bridge init
-# Creates ~/.mcp-bridge/config.json
-\`\`\`
+# Creates ~/.mcp-bridge/config.json with a generated API password
+```
 
-### 3. Add MCP Servers
+**2. Add a server**
+```bash
+mcp-oauth-bridge add granola https://mcp.granola.ai/mcp \
+  --auth-url https://auth.granola.ai/oauth/authorize \
+  --token-url https://auth.granola.ai/oauth/token \
+  --client-id <your-client-id> \
+  --scopes "read write"
+```
 
-\`\`\`bash
-mcp-oauth-bridge add granola https://mcp.granola.ai/mcp
-mcp-oauth-bridge add clarify https://api.clarify.ai/mcp
-\`\`\`
-
-### 4. Authenticate
-
-\`\`\`bash
+**3. Authenticate** (run this on your local machine, not the VPS)
+```bash
 mcp-oauth-bridge auth granola
-# Opens browser for OAuth
-\`\`\`
+# Opens browser. On headless machines: --manual to paste the redirect URL instead.
+```
 
-### 5. Start Bridge
+**4. Deploy tokens to VPS**
+```bash
+scp -r ~/.mcp-bridge/tokens/ user@your-vps:~/.mcp-bridge/
+```
 
-\`\`\`bash
-mcp-oauth-bridge start --port 3000 --password your-secure-password
-# Bridge running at http://localhost:3000
-\`\`\`
+**5. Start the bridge**
+```bash
+mcp-oauth-bridge start --port 3000 --host 0.0.0.0
+```
 
-### 6. Use from Remote Server
+**6. Use it**
+```bash
+curl -H "Authorization: Bearer <password>" http://your-vps:3000/mcp/granola/tools
+curl -H "Authorization: Bearer <password>" http://your-vps:3000/mcp/granola/call \
+  -d '{"tool": "search_meetings", "arguments": {"query": "roadmap"}}'
+```
 
-\`\`\`bash
-# From OpenClaw or any MCP client:
-curl -H "Authorization: Bearer your-secure-password" \
-  http://your-mac-ip:3000/mcp/granola/tools
-\`\`\`
+## CLI Reference
 
-## Configuration
+| Command | Description |
+|---------|-------------|
+| `init` | Create `~/.mcp-bridge/config.json` |
+| `add <name> <url> [options]` | Register an MCP server |
+| `remove <name>` | Remove a server and delete its token |
+| `list` | Show servers and auth status |
+| `auth <name> [--manual] [--callback-port N]` | Run OAuth flow |
+| `start [--port N] [--host H]` | Start the HTTP bridge |
 
-\`~/.mcp-bridge/config.json\`:
+## API
 
-\`\`\`json
+All routes (except `/health`) require `Authorization: Bearer <password>`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Status check |
+| `GET` | `/servers` | List servers and token status |
+| `GET` | `/mcp/:server/tools` | List tools from an MCP server |
+| `POST` | `/mcp/:server/call` | Call a tool: `{"tool": "...", "arguments": {...}}` |
+
+## Config
+
+`~/.mcp-bridge/config.json` is generated by `init`. The `servers` block is populated by `add`:
+
+```json
 {
   "port": 3000,
-  "auth": {
-    "type": "password",
-    "password": "your-secure-password"
-  },
+  "host": "localhost",
+  "auth": { "type": "password", "password": "generated-password" },
   "servers": {
     "granola": {
+      "name": "granola",
       "url": "https://mcp.granola.ai/mcp",
       "oauth": {
-        "tokenPath": "~/.mcp-bridge/tokens/granola.json"
-      }
-    },
-    "clarify": {
-      "url": "https://api.clarify.ai/mcp",
-      "oauth": {
-        "tokenPath": "~/.mcp-bridge/tokens/clarify.json"
+        "authorizationUrl": "https://auth.granola.ai/oauth/authorize",
+        "tokenUrl": "https://auth.granola.ai/oauth/token",
+        "clientId": "your-client-id",
+        "scopes": ["read", "write"]
       }
     }
   }
 }
-\`\`\`
+```
 
-## API Endpoints
+## Requirements
 
-### List Servers
-\`GET /servers\`
-
-### List Tools for a Server
-\`GET /mcp/:server/tools\`
-
-### Call a Tool
-\`POST /mcp/:server/call\`
-\`\`\`json
-{
-  "tool": "search_meetings",
-  "args": {
-    "query": "product roadmap"
-  }
-}
-\`\`\`
-
-## Use Cases
-
-- **OpenClaw on VPS**: Access Granola meeting notes from remote agent
-- **CI/CD**: Use MCP tools in GitHub Actions
-- **Docker**: Run MCP clients in containers
-- **Remote Dev**: Access OAuth MCPs from remote workspaces
-
-## Supported MCP Servers
-
-Tested with:
-- ✅ Granola (meeting notes)
-- ✅ Clarify (CRM)
-- ✅ Linear (project management)
-- ✅ Notion (notes/docs)
-- ✅ Any OAuth 2.0 MCP server
-
-## Architecture
-
-\`\`\`
-┌─────────────────┐
-│  MCP Client     │
-│  (OpenClaw/etc) │
-└────────┬────────┘
-         │ HTTP + Auth
-         ▼
-┌─────────────────┐
-│  MCP OAuth      │
-│  Bridge         │
-│  • Auth Handler │
-│  • Token Cache  │
-│  • Proxy        │
-└────────┬────────┘
-         │ OAuth + JWT
-         ▼
-┌─────────────────┐
-│  MCP Servers    │
-│  • Granola      │
-│  • Clarify      │
-│  • etc.         │
-└─────────────────┘
-\`\`\`
-
-## Development
-
-\`\`\`bash
-git clone https://github.com/YOUR_USERNAME/mcp-oauth-bridge
-cd mcp-oauth-bridge
-npm install
-npm run dev
-\`\`\`
+- Node.js ≥ 18
+- A local machine with a browser (for the initial `auth` step)
+- The target MCP server must support OAuth 2.0 Authorization Code flow (PKCE supported)
 
 ## Contributing
 
-Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md)
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT © 2026
-
-## Related Projects
-
-- [OpenClaw](https://github.com/openclaw/openclaw) - Personal AI assistant
-- [Model Context Protocol](https://modelcontextprotocol.io/)
-- [mcporter](https://github.com/modelcontextprotocol/mcporter) - MCP CLI
-
-## Credits
-
-Built to solve the OAuth headless problem for OpenClaw users.
-
----
-
-**Star ⭐ this repo if you find it useful!**
+MIT © 2026 Rami

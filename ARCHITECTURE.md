@@ -1,154 +1,91 @@
-# MCP OAuth Bridge - Architecture
+# Architecture
 
-## Design Philosophy
+## Core Idea
 
-**Problem:** OAuth requires browser interaction, but MCP clients often run headless (VPS, Docker, CI/CD).
+OAuth requires a browser for the initial authorization step. Headless servers don't have one. The bridge solves this by splitting auth from runtime:
 
-**Solution:** Separate auth (one-time, local) from runtime (continuous, anywhere).
+- **Auth** happens once on a local machine (where a browser works)
+- **Runtime** happens on the VPS with the saved tokens, auto-refreshed forever
 
----
+## Flow
 
-## Architecture v2: Hybrid Approach
-
-### Phase 1: Setup & Authentication (Local Machine)
-
-```
-┌─────────────────────────────────────────────────┐
-│  Local Machine (Mac/Windows/Linux)             │
-│                                                 │
-│  1. mcp-oauth-bridge init                      │
-│  2. mcp-oauth-bridge add granola <url>         │
-│  3. mcp-oauth-bridge auth granola              │
-│      └─▶ Opens browser                         │
-│      └─▶ User completes OAuth                  │
-│      └─▶ Token saved to ~/.mcp-bridge/tokens/  │
-│                                                 │
-└─────────────────────────────────────────────────┘
-              │
-              │ Copy tokens to VPS
-              ▼
-┌─────────────────────────────────────────────────┐
-│  VPS / Remote Server                            │
-│                                                 │
-│  ~/.mcp-bridge/                                 │
-│    ├── config.json                              │
-│    └── tokens/                                  │
-│         ├── granola.json (OAuth token)          │
-│         └── clarify.json                        │
-│                                                 │
-└─────────────────────────────────────────────────┘
-```
-
-### Phase 2: Runtime (VPS/Remote)
+### Step 1 — Authenticate locally
 
 ```
-┌──────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  OpenClaw        │────▶│  MCP Bridge      │────▶│  Granola MCP    │
-│  (local VPS)     │HTTP │  (same VPS)      │OAuth│                 │
-│                  │     │                  │     │  Clarify MCP    │
-│  • Calls tools   │     │  • Proxies calls │     │                 │
-│  • Gets responses│     │  • Refreshes     │     │  Any OAuth MCP  │
-│                  │     │    tokens auto   │     │                 │
-└──────────────────┘     │  • Caches        │     └─────────────────┘
-                         └──────────────────┘
-                                  │
-                                  │ (uses cached tokens)
-                                  │ (auto-refreshes)
-                                  ▼
-                         ~/.mcp-bridge/tokens/
+mcp-oauth-bridge auth <server>
+        │
+        ├─ generates PKCE code_verifier + code_challenge (SHA-256)
+        ├─ starts callback server on localhost:8080
+        ├─ opens browser → user completes OAuth
+        ├─ callback server receives authorization code
+        ├─ exchanges code + code_verifier for access + refresh tokens
+        └─ saves token to ~/.mcp-bridge/tokens/<server>.json (mode 600)
 ```
 
----
+### Step 2 — Deploy
 
-## Token Management
-
-### Initial Authentication
-1. User runs `mcp-oauth-bridge auth <server>` on local machine
-2. Opens browser for OAuth
-3. Token saved locally with refresh token
-
-### Token Deployment
 ```bash
-# Copy tokens to VPS
 scp -r ~/.mcp-bridge/tokens/ user@vps:~/.mcp-bridge/
 ```
 
-### Auto-Refresh
-- Bridge automatically refreshes OAuth tokens before expiry
-- No manual intervention needed
-- Tokens stay valid indefinitely
+### Step 3 — Runtime on VPS
 
----
-
-## Alternative: Manual OAuth (No Local Machine Needed)
-
-For users without local machines:
-
-```bash
-mcp-oauth-bridge auth granola --manual
+```
+MCP client  →  GET /mcp/granola/tools  →  bridge
+                                              │
+                                  load token from disk
+                                  if expired → POST tokenUrl (refresh)
+                                  save new token
+                                              │
+                                     POST granola.url (JSON-RPC)
+                                     Authorization: Bearer <access_token>
+                                              │
+                                        return tools list
 ```
 
-Output:
-```
-🔗 Visit this URL in ANY browser:
-https://mcp.granola.ai/oauth/authorize?client_id=...&redirect_uri=...
+## Components
 
-After approving, you'll be redirected to:
-http://localhost:8080/callback?code=...
+| File | Responsibility |
+|------|---------------|
+| `config.ts` | Reads/writes `~/.mcp-bridge/config.json`. Manages server registry. |
+| `tokens.ts` | Loads/saves tokens. Checks expiry (5-min buffer). Handles refresh token rotation. |
+| `oauth.ts` | PKCE flow: generates params, runs callback server, exchanges code for token. |
+| `mcp-client.ts` | Sends JSON-RPC 2.0 requests to upstream MCP servers with valid Bearer token. |
+| `server.ts` | Express API. Auth middleware validates the bridge's own password. |
+| `cli.ts` | Commander CLI wiring all the above together. |
 
-📋 Paste the FULL URL here:
-```
+## Token Refresh
 
-User pastes → Bridge extracts token → Saves
+Tokens are refreshed proactively (5 minutes before expiry) inside `TokenManager.getValidToken()`, which is called by `MCPClient` before every upstream request. Refresh token rotation is handled — if the server returns a new `refresh_token`, it replaces the old one on disk.
 
----
-
-## Deployment Options
-
-### Option 1: VPS Only (Recommended)
-```bash
-# One-time setup on Mac:
-mcp-oauth-bridge auth granola
-mcp-oauth-bridge auth clarify
-
-# Deploy to VPS:
-scp -r ~/.mcp-bridge root@vps:~/
-ssh root@vps "mcp-oauth-bridge start"
-```
-
-### Option 2: Local Bridge (Original Plan)
-```bash
-# Bridge runs on Mac
-# OpenClaw on VPS connects to Mac bridge
-mcp-oauth-bridge start --host 0.0.0.0
-```
-
-### Option 3: Docker
-```bash
-docker run -v ~/.mcp-bridge:/root/.mcp-bridge \
-  mcp-oauth-bridge:latest
-```
-
----
+**Known limitation:** `getValidToken` is not concurrency-safe. For single-process sequential use this is fine; a production hardening would use a per-server mutex.
 
 ## Security
 
-1. **Token Storage**: Encrypted at rest
-2. **API Auth**: Bearer token or password
-3. **Network**: Can bind to localhost only
-4. **Token Rotation**: Automatic refresh
-5. **Audit Log**: All calls logged
+- Token files are written with mode `600` (user read/write only)
+- Bridge API requires a Bearer token on every request (except `/health`)
+- PKCE is used for the OAuth flow — no client secret needed for public clients
+- Tokens are stored as plaintext JSON (encryption at rest is on the [roadmap](TODO.md))
 
----
+## Deployment Options
 
-## Comparison
+**Option A: Auth local, run on VPS** (recommended)
+```bash
+# Local machine:
+mcp-oauth-bridge auth granola
+scp -r ~/.mcp-bridge/ user@vps:~/
 
-| Approach | Setup | Runtime | Pros | Cons |
-|----------|-------|---------|------|------|
-| **Hybrid (Recommended)** | Local Mac | VPS | Simple, no Mac dependency after setup | One-time manual step |
-| **Local Bridge** | Local Mac | Local Mac | No VPS config | Mac must stay on |
-| **Manual OAuth** | VPS | VPS | 100% remote | Copy-paste for each MCP |
+# VPS:
+mcp-oauth-bridge start --host 0.0.0.0
+```
 
----
+**Option B: Run the bridge locally, access remotely**
+```bash
+mcp-oauth-bridge start --host 0.0.0.0
+# Clients on other machines connect to your local IP
+```
 
-**Recommendation: Use Hybrid approach** - best balance of simplicity and functionality.
+**Option C: Docker** (not yet shipped — see [TODO](TODO.md))
+```bash
+docker run -v ~/.mcp-bridge:/root/.mcp-bridge mcp-oauth-bridge
+```
