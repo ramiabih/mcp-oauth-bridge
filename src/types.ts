@@ -2,14 +2,19 @@
  * Core types for MCP OAuth Bridge
  */
 
+export interface OAuthConfig {
+  tokenPath?: string;
+  authorizationUrl?: string;
+  tokenUrl?: string;
+  clientId?: string;
+  clientSecret?: string;
+  scopes?: string[];
+}
+
 export interface MCPServer {
   name: string;
   url: string;
-  oauth?: {
-    tokenPath?: string;
-    clientId?: string;
-    clientSecret?: string;
-  };
+  oauth?: OAuthConfig;
 }
 
 export interface OAuthToken {
@@ -38,15 +43,26 @@ export interface BridgeConfig {
 export interface MCPTool {
   name: string;
   description: string;
-  inputSchema: any;
+  inputSchema: Record<string, unknown>;
 }
 
 export interface MCPCallRequest {
   tool: string;
-  arguments: any;
+  arguments: Record<string, unknown>;
 }
 
 export interface MCPCallResponse {
-  content: any[];
+  content: Array<{ type: string; text: string }>;
   isError?: boolean;
+}
+
+export interface PKCEParams {
+  codeVerifier: string;
+  codeChallenge: string;
+  codeChallengeMethod: 'S256';
+}
+
+export interface OAuthCallbackResult {
+  code: string;
+  state: string;
 }
