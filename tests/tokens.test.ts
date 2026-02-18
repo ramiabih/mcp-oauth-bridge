@@ -10,9 +10,9 @@ jest.mock('axios');
 const mockedAxios = axios as jest.Mocked<typeof axios>;
 
 // Attach isAxiosError so TokenManager's catch block works
-mockedAxios.isAxiosError = jest.fn((err: unknown): err is import('axios').AxiosError => {
-  return (err as { isAxiosError?: boolean }).isAxiosError === true;
-}) as typeof axios.isAxiosError;
+(mockedAxios.isAxiosError as unknown as jest.Mock).mockImplementation(
+  (err: unknown) => (err as { isAxiosError?: boolean }).isAxiosError === true
+);
 
 // --- Helpers ---
 
