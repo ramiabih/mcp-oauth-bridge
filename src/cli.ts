@@ -1,21 +1,15 @@
 #!/usr/bin/env node
+
 /**
- * MCP OAuth Bridge CLI
- *
- * Commands:
- *   init              Initialize configuration
- *   add <name> <url>  Add an MCP server
- *   remove <name>     Remove an MCP server
- *   list              List configured servers with auth status
- *   auth <name>       Authenticate via OAuth
- *   start             Start the HTTP bridge server
+ * Command-line interface for MCP OAuth Bridge
  */
 import { Command } from 'commander';
 import chalk from 'chalk';
 import { ConfigManager } from './config';
 import { TokenManager } from './tokens';
-import { runOAuthFlow } from './oauth';
-import { startServer } from './server';
+import { OAuthHandler } from './oauth';
+import { MCPClient } from './mcp-client';
+import { BridgeServer } from './server';
 
 const program = new Command();
 
@@ -24,149 +18,249 @@ program
   .description('Bridge OAuth-based MCP servers to headless environments')
   .version('0.1.0');
 
-// --- init ---
-
+/**
+ * Initialize config directory
+ */
 program
   .command('init')
-  .description('Initialize configuration in ~/.mcp-bridge')
+  .description('Initialize config directory')
   .action(async () => {
     try {
       const configManager = new ConfigManager();
       await configManager.init();
-    } catch (err) {
-      console.error(chalk.red('Error:'), err instanceof Error ? err.message : String(err));
+    } catch (error: any) {
+      console.error(chalk.red('❌ Error:'), error.message);
       process.exit(1);
     }
   });
 
-// --- add ---
-
+/**
+ * Add MCP server
+ */
 program
   .command('add <name> <url>')
-  .description('Add an MCP server')
-  .requiredOption('--auth-url <url>', 'OAuth authorization endpoint')
-  .requiredOption('--token-url <url>', 'OAuth token endpoint')
-  .requiredOption('--client-id <id>', 'OAuth client ID')
-  .option('--client-secret <secret>', 'OAuth client secret (omit for public/PKCE clients)')
-  .option('--scopes <scopes>', 'Space-separated OAuth scopes (e.g. "read write")', 'openid')
-  .action(async (name: string, url: string, options) => {
+  .description('Add MCP server')
+  .option('--client-id <id>', 'OAuth client ID')
+  .option('--client-secret <secret>', 'OAuth client secret')
+  .option('--auth-endpoint <url>', 'OAuth authorization endpoint')
+  .option('--token-endpoint <url>', 'OAuth token endpoint')
+  .option('--scope <scope>', 'OAuth scope')
+  .action(async (name: string, url: string, options: any) => {
     try {
       const configManager = new ConfigManager();
-      await configManager.addServer(name, url, {
-        authorizationUrl: options.authUrl,
-        tokenUrl: options.tokenUrl,
-        clientId: options.clientId,
-        clientSecret: options.clientSecret,
-        scopes: (options.scopes as string).split(' ').filter(Boolean),
-      });
-      console.log(chalk.dim(`\nNext step: mcp-oauth-bridge auth ${name}`));
-    } catch (err) {
-      console.error(chalk.red('Error:'), err instanceof Error ? err.message : String(err));
+      await configManager.addServer(name, url);
+
+      // Add OAuth config if provided
+      if (options.clientId || options.authEndpoint || options.tokenEndpoint) {
+        const config = await configManager.load();
+        const server = config.servers[name];
+
+        if (!server.oauth) {
+          server.oauth = {};
+        }
+
+        if (options.clientId) server.oauth.clientId = options.clientId;
+        if (options.clientSecret) server.oauth.clientSecret = options.clientSecret;
+
+        await configManager.save(config);
+        console.log(chalk.green('✅ OAuth config added'));
+      }
+    } catch (error: any) {
+      console.error(chalk.red('❌ Error:'), error.message);
       process.exit(1);
     }
   });
 
-// --- remove ---
-
+/**
+ * Remove MCP server
+ */
 program
   .command('remove <name>')
-  .description('Remove an MCP server and delete its stored token')
+  .description('Remove MCP server')
   .action(async (name: string) => {
     try {
       const configManager = new ConfigManager();
       await configManager.removeServer(name);
-    } catch (err) {
-      console.error(chalk.red('Error:'), err instanceof Error ? err.message : String(err));
+    } catch (error: any) {
+      console.error(chalk.red('❌ Error:'), error.message);
       process.exit(1);
     }
   });
 
-// --- list ---
-
+/**
+ * List configured servers
+ */
 program
   .command('list')
-  .description('List configured servers with authentication status')
+  .description('List configured servers')
   .action(async () => {
     try {
       const configManager = new ConfigManager();
-      const tokenManager = new TokenManager(configManager);
       const servers = await configManager.listServers();
 
       if (servers.length === 0) {
-        console.log(chalk.yellow('No servers configured. Run: mcp-oauth-bridge add <name> <url> ...'));
+        console.log(chalk.yellow('No servers configured'));
+        console.log('\nAdd a server with:');
+        console.log('  mcp-oauth-bridge add <name> <url>');
         return;
       }
 
-      console.log(chalk.bold('\nConfigured servers:\n'));
-
+      console.log(chalk.bold('\n📋 Configured MCP Servers:\n'));
       for (const server of servers) {
-        const token = await tokenManager.loadToken(server.name);
-        let status: string;
-
-        if (!token) {
-          status = chalk.red(`[no token — run: mcp-oauth-bridge auth ${server.name}]`);
-        } else if (tokenManager.isExpired(token)) {
-          status = chalk.yellow(`[token expired — run: mcp-oauth-bridge auth ${server.name}]`);
-        } else {
-          status = chalk.green('[authenticated]');
+        console.log(chalk.cyan(`  ${server.name}`));
+        console.log(`    URL: ${server.url}`);
+        if (server.oauth?.clientId) {
+          console.log(`    OAuth: Configured (client_id: ${server.oauth.clientId})`);
         }
-
-        const paddedName = server.name.padEnd(12);
-        const paddedUrl = server.url.padEnd(40);
-        console.log(`  ${chalk.bold(paddedName)} ${chalk.dim(paddedUrl)} ${status}`);
+        console.log('');
       }
-
-      console.log('');
-    } catch (err) {
-      console.error(chalk.red('Error:'), err instanceof Error ? err.message : String(err));
+    } catch (error: any) {
+      console.error(chalk.red('❌ Error:'), error.message);
       process.exit(1);
     }
   });
 
-// --- auth ---
-
+/**
+ * Authenticate with OAuth
+ */
 program
   .command('auth <name>')
-  .description('Authenticate with an MCP server via OAuth (run this on your local machine)')
-  .option('--callback-port <port>', 'Port for the local OAuth callback server', '8080')
-  .option('--manual', 'Manual flow: paste the redirect URL instead of opening a browser')
-  .action(async (name: string, options) => {
+  .description('Authenticate with OAuth')
+  .option('--client-id <id>', 'OAuth client ID (if not in config)')
+  .option('--client-secret <secret>', 'OAuth client secret (if not in config)')
+  .option('--auth-endpoint <url>', 'OAuth authorization endpoint')
+  .option('--token-endpoint <url>', 'OAuth token endpoint')
+  .option('--scope <scope>', 'OAuth scope')
+  .action(async (name: string, options: any) => {
     try {
       const configManager = new ConfigManager();
-      const tokenManager = new TokenManager(configManager);
+      const tokenManager = new TokenManager(configManager.getTokensDir());
+
       const server = await configManager.getServer(name);
 
-      await runOAuthFlow(name, server, tokenManager, {
-        callbackPort: parseInt(options.callbackPort, 10),
-        manual: Boolean(options.manual),
+      // Get OAuth config from options or server config
+      const clientId = options.clientId || server.oauth?.clientId;
+      const clientSecret = options.clientSecret || server.oauth?.clientSecret;
+      const authEndpoint = options.authEndpoint;
+      const tokenEndpoint = options.tokenEndpoint;
+      const scope = options.scope;
+
+      if (!clientId) {
+        throw new Error(
+          'Missing client ID. Provide --client-id or add to config with: ' +
+          `mcp-oauth-bridge add ${name} ${server.url} --client-id <id>`
+        );
+      }
+
+      if (!authEndpoint || !tokenEndpoint) {
+        throw new Error(
+          'Missing OAuth endpoints. Provide --auth-endpoint and --token-endpoint'
+        );
+      }
+
+      const oauthHandler = new OAuthHandler();
+      const token = await oauthHandler.authenticate(name, {
+        clientId,
+        clientSecret,
+        authorizationEndpoint: authEndpoint,
+        tokenEndpoint,
+        scope,
       });
 
-      console.log(chalk.dim('\nTo deploy to a VPS, copy your tokens:'));
-      console.log(chalk.dim(`  scp -r ~/.mcp-bridge/tokens/ user@your-vps:~/.mcp-bridge/`));
-    } catch (err) {
-      console.error(chalk.red('Error:'), err instanceof Error ? err.message : String(err));
+      await tokenManager.saveToken(name, token);
+      console.log(chalk.green('\n✅ Authentication successful!'));
+      console.log(`Token saved and will expire in ${token.expires_in ? Math.floor(token.expires_in / 60) : '?'} minutes`);
+    } catch (error: any) {
+      console.error(chalk.red('\n❌ Authentication failed:'), error.message);
       process.exit(1);
     }
   });
 
-// --- start ---
-
+/**
+ * List tokens
+ */
 program
-  .command('start')
-  .description('Start the bridge HTTP server')
-  .option('--port <port>', 'HTTP server port (overrides config)')
-  .option('--host <host>', 'Bind address (overrides config)')
-  .action(async (options) => {
+  .command('tokens')
+  .description('List saved tokens')
+  .action(async () => {
     try {
       const configManager = new ConfigManager();
-      await startServer(configManager, {
-        port: options.port ? parseInt(options.port, 10) : undefined,
-        host: options.host,
-      });
-    } catch (err) {
-      console.error(chalk.red('Error:'), err instanceof Error ? err.message : String(err));
+      const tokenManager = new TokenManager(configManager.getTokensDir());
+
+      const tokens = await tokenManager.listTokens();
+
+      if (tokens.length === 0) {
+        console.log(chalk.yellow('No tokens saved'));
+        console.log('\nAuthenticate with:');
+        console.log('  mcp-oauth-bridge auth <server-name>');
+        return;
+      }
+
+      console.log(chalk.bold('\n🔑 Saved Tokens:\n'));
+      for (const serverName of tokens) {
+        const token = await tokenManager.loadToken(serverName);
+        if (token) {
+          const expired = tokenManager.isExpired(token);
+          const status = expired ? chalk.red('EXPIRED') : chalk.green('VALID');
+          console.log(`  ${chalk.cyan(serverName)} - ${status}`);
+          if (token.expires_at) {
+            const expiresAt = new Date(token.expires_at);
+            console.log(`    Expires: ${expiresAt.toLocaleString()}`);
+          }
+          console.log('');
+        }
+      }
+    } catch (error: any) {
+      console.error(chalk.red('❌ Error:'), error.message);
       process.exit(1);
     }
   });
 
+/**
+ * Start bridge server
+ */
+program
+  .command('start')
+  .description('Start bridge server')
+  .option('--port <port>', 'Server port', '3000')
+  .option('--host <host>', 'Server host', 'localhost')
+  .action(async (options: any) => {
+    try {
+      const configManager = new ConfigManager();
+      const config = await configManager.load();
+
+      // Override with CLI options
+      config.port = parseInt(options.port, 10);
+      config.host = options.host;
+
+      const tokenManager = new TokenManager(configManager.getTokensDir());
+      const mcpClient = new MCPClient(configManager, tokenManager);
+      const server = new BridgeServer(config, mcpClient);
+
+      // Handle shutdown signals
+      process.on('SIGINT', async () => {
+        console.log('\n\nShutting down...');
+        await server.stop();
+        process.exit(0);
+      });
+
+      process.on('SIGTERM', async () => {
+        console.log('\n\nShutting down...');
+        await server.stop();
+        process.exit(0);
+      });
+
+      await server.start();
+    } catch (error: any) {
+      console.error(chalk.red('❌ Error:'), error.message);
+      process.exit(1);
+    }
+  });
+
+// Parse command line arguments
 program.parse(process.argv);
+
+// Show help if no command specified
+if (!process.argv.slice(2).length) {
+  program.outputHelp();
+}

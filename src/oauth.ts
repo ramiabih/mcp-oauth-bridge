@@ -1,300 +1,270 @@
 /**
- * OAuth 2.0 PKCE Authorization Code flow handler.
- *
- * Designed for local-machine use: opens a browser, starts a one-shot callback
- * server, exchanges the code for tokens, and saves them via TokenManager.
- * A --manual fallback allows pasting the redirect URL when a browser is not available.
+ * OAuth handler - opens browser and captures tokens
  */
 import * as http from 'http';
 import * as crypto from 'crypto';
-import * as readline from 'readline';
-import open from 'open';
+import * as open from 'open';
 import axios from 'axios';
-import chalk from 'chalk';
-import { OAuthToken, MCPServer, PKCEParams, OAuthCallbackResult } from './types';
-import { TokenManager } from './tokens';
+import { URL } from 'url';
+import { OAuthToken } from './types';
 
-const DEFAULT_CALLBACK_PORT = 8080;
-const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-
-// --- PKCE helpers ---
-
-function generatePKCE(): PKCEParams {
-  // code_verifier: 43-128 URL-safe chars (RFC 7636)
-  const codeVerifier = crypto.randomBytes(32).toString('base64url');
-
-  const codeChallenge = crypto
-    .createHash('sha256')
-    .update(codeVerifier)
-    .digest('base64url');
-
-  return { codeVerifier, codeChallenge, codeChallengeMethod: 'S256' };
+interface PKCECodes {
+  verifier: string;
+  challenge: string;
 }
 
-function generateState(): string {
-  return crypto.randomBytes(16).toString('hex');
+interface OAuthConfig {
+  clientId: string;
+  clientSecret?: string;
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+  redirectUri?: string;
+  scope?: string;
 }
 
-// --- Authorization URL ---
+export class OAuthHandler {
+  private server: http.Server | null = null;
+  private port: number = 8080;
+  private pkceVerifier: string | null = null;
 
-function buildAuthorizationUrl(
-  server: MCPServer,
-  pkce: PKCEParams,
-  state: string,
-  callbackPort: number
-): string {
-  const oauth = server.oauth!;
-  const redirectUri = `http://localhost:${callbackPort}/callback`;
+  /**
+   * Generate PKCE code verifier and challenge
+   */
+  private generatePKCE(): PKCECodes {
+    // Generate random 32-byte verifier
+    const verifier = crypto.randomBytes(32).toString('base64url');
 
-  const params = new URLSearchParams({
-    response_type: 'code',
-    client_id: oauth.clientId!,
-    redirect_uri: redirectUri,
-    state,
-    code_challenge: pkce.codeChallenge,
-    code_challenge_method: pkce.codeChallengeMethod,
-  });
+    // Create SHA-256 hash challenge
+    const challenge = crypto
+      .createHash('sha256')
+      .update(verifier)
+      .digest('base64url');
 
-  if (oauth.scopes && oauth.scopes.length > 0) {
-    params.set('scope', oauth.scopes.join(' '));
+    return { verifier, challenge };
   }
 
-  return `${oauth.authorizationUrl}?${params.toString()}`;
-}
+  /**
+   * Build authorization URL with PKCE
+   */
+  buildAuthorizationUrl(config: OAuthConfig): string {
+    const pkce = this.generatePKCE();
+    this.pkceVerifier = pkce.verifier;
 
-// --- Callback server ---
+    const redirectUri = config.redirectUri || `http://localhost:${this.port}/callback`;
+    const state = crypto.randomBytes(16).toString('hex');
 
-/**
- * Starts a one-shot HTTP server that waits for the OAuth redirect callback.
- * Resolves with { code, state } once received, then shuts itself down.
- * Rejects after timeoutMs.
- */
-function waitForCallback(
-  callbackPort: number,
-  timeoutMs: number = DEFAULT_TIMEOUT_MS
-): Promise<OAuthCallbackResult> {
-  return new Promise((resolve, reject) => {
-    const server = http.createServer((req, res) => {
-      const reqUrl = new URL(req.url ?? '/', `http://localhost:${callbackPort}`);
-
-      if (reqUrl.pathname !== '/callback') {
-        res.writeHead(404);
-        res.end('Not found');
-        return;
-      }
-
-      const code = reqUrl.searchParams.get('code');
-      const state = reqUrl.searchParams.get('state');
-      const error = reqUrl.searchParams.get('error');
-
-      if (error) {
-        res.writeHead(400, { 'Content-Type': 'text/html' });
-        res.end(`<h1>Authentication failed</h1><p>${reqUrl.searchParams.get('error_description') ?? error}</p>`);
-        server.close();
-        reject(new Error(`OAuth error: ${error}`));
-        return;
-      }
-
-      if (!code || !state) {
-        res.writeHead(400, { 'Content-Type': 'text/html' });
-        res.end('<h1>Missing code or state</h1>');
-        server.close();
-        reject(new Error('OAuth callback missing code or state parameter'));
-        return;
-      }
-
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(
-        '<html><body style="font-family:sans-serif;text-align:center;padding:50px">' +
-        '<h1>Authentication successful!</h1>' +
-        '<p>You can close this tab and return to the terminal.</p>' +
-        '</body></html>'
-      );
-
-      server.close();
-      resolve({ code, state });
+    const params = new URLSearchParams({
+      client_id: config.clientId,
+      response_type: 'code',
+      redirect_uri: redirectUri,
+      code_challenge: pkce.challenge,
+      code_challenge_method: 'S256',
+      state,
     });
 
-    const timeout = setTimeout(() => {
-      server.close();
-      reject(new Error(`OAuth callback timed out after ${timeoutMs / 1000}s`));
-    }, timeoutMs);
-
-    server.on('error', (err: NodeJS.ErrnoException) => {
-      clearTimeout(timeout);
-      if (err.code === 'EADDRINUSE') {
-        reject(new Error(
-          `Port ${callbackPort} is already in use. Use --callback-port to choose a different port.`
-        ));
-      } else {
-        reject(err);
-      }
-    });
-
-    server.listen(callbackPort, 'localhost', () => {
-      // Server is ready
-    });
-
-    server.on('close', () => clearTimeout(timeout));
-  });
-}
-
-// --- Manual fallback ---
-
-/**
- * Prompts the user to paste the full redirect URL from their browser.
- * Used when --manual is passed or when open() fails.
- */
-async function manualCallback(): Promise<OAuthCallbackResult> {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
-  return new Promise((resolve, reject) => {
-    rl.question(
-      chalk.cyan('\nPaste the full redirect URL from your browser:\n> '),
-      (answer) => {
-        rl.close();
-        try {
-          const parsed = new URL(answer.trim());
-          const code = parsed.searchParams.get('code');
-          const state = parsed.searchParams.get('state');
-
-          if (!code || !state) {
-            reject(new Error('Could not parse code or state from the pasted URL'));
-            return;
-          }
-
-          resolve({ code, state });
-        } catch {
-          reject(new Error('Invalid URL pasted'));
-        }
-      }
-    );
-  });
-}
-
-// --- Token exchange ---
-
-async function exchangeCodeForToken(
-  server: MCPServer,
-  code: string,
-  pkce: PKCEParams,
-  callbackPort: number
-): Promise<OAuthToken> {
-  const oauth = server.oauth!;
-  const redirectUri = `http://localhost:${callbackPort}/callback`;
-
-  const params = new URLSearchParams({
-    grant_type: 'authorization_code',
-    code,
-    redirect_uri: redirectUri,
-    client_id: oauth.clientId!,
-    code_verifier: pkce.codeVerifier,
-  });
-
-  if (oauth.clientSecret) {
-    params.append('client_secret', oauth.clientSecret);
-  }
-
-  try {
-    const response = await axios.post<OAuthToken>(
-      oauth.tokenUrl!,
-      params.toString(),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    );
-    return response.data;
-  } catch (err) {
-    if (axios.isAxiosError(err)) {
-      const status = err.response?.status;
-      const body = JSON.stringify(err.response?.data ?? {});
-      throw new Error(`Token exchange failed (HTTP ${status}): ${body}`);
+    if (config.scope) {
+      params.append('scope', config.scope);
     }
-    throw err;
-  }
-}
 
-// --- Main entry point ---
-
-export interface OAuthFlowOptions {
-  callbackPort?: number;
-  manual?: boolean;
-}
-
-/**
- * Runs a full PKCE OAuth 2.0 Authorization Code flow and saves the resulting token.
- *
- * Flow:
- *   1. Validate server has required OAuth config
- *   2. Generate PKCE params + state
- *   3. Build authorization URL
- *   4. Start callback server (or use manual flow)
- *   5. Open browser (falls back to printing URL)
- *   6. Wait for callback
- *   7. Verify state (CSRF protection)
- *   8. Exchange code for token
- *   9. Save token via TokenManager
- */
-export async function runOAuthFlow(
-  serverName: string,
-  server: MCPServer,
-  tokenManager: TokenManager,
-  options: OAuthFlowOptions = {}
-): Promise<OAuthToken> {
-  const { callbackPort = DEFAULT_CALLBACK_PORT, manual = false } = options;
-
-  // Validate required OAuth config
-  if (!server.oauth?.authorizationUrl) {
-    throw new Error(`Server '${serverName}' has no authorizationUrl. Run: mcp-oauth-bridge add with --auth-url`);
-  }
-  if (!server.oauth?.tokenUrl) {
-    throw new Error(`Server '${serverName}' has no tokenUrl. Run: mcp-oauth-bridge add with --token-url`);
-  }
-  if (!server.oauth?.clientId) {
-    throw new Error(`Server '${serverName}' has no clientId. Run: mcp-oauth-bridge add with --client-id`);
+    return `${config.authorizationEndpoint}?${params.toString()}`;
   }
 
-  const pkce = generatePKCE();
-  const state = generateState();
-  const authUrl = buildAuthorizationUrl(server, pkce, state, callbackPort);
+  /**
+   * Exchange authorization code for access token
+   */
+  private async exchangeCodeForToken(
+    code: string,
+    config: OAuthConfig
+  ): Promise<OAuthToken> {
+    if (!this.pkceVerifier) {
+      throw new Error('PKCE verifier not found - call buildAuthorizationUrl first');
+    }
 
-  let callbackResult: OAuthCallbackResult;
+    const redirectUri = config.redirectUri || `http://localhost:${this.port}/callback`;
 
-  if (manual) {
-    console.log(chalk.bold('\nOpen this URL in your browser to authenticate:'));
-    console.log(chalk.cyan(authUrl));
-    callbackResult = await manualCallback();
-  } else {
-    // Start callback server first, then open browser
-    const callbackPromise = waitForCallback(callbackPort);
+    const params = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: this.pkceVerifier,
+      client_id: config.clientId,
+    });
 
-    console.log(chalk.bold(`\nOpening browser for authentication...`));
-    console.log(chalk.dim(`Callback listening on http://localhost:${callbackPort}/callback`));
-    console.log(chalk.dim('\nIf the browser did not open, visit this URL manually:'));
-    console.log(chalk.cyan(authUrl));
+    if (config.clientSecret) {
+      params.append('client_secret', config.clientSecret);
+    }
 
     try {
-      await open(authUrl);
-    } catch {
-      // Browser open failed — user will use the printed URL
+      const response = await axios.post(config.tokenEndpoint, params, {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+      });
+
+      const token: OAuthToken = {
+        access_token: response.data.access_token,
+        refresh_token: response.data.refresh_token,
+        token_type: response.data.token_type || 'Bearer',
+        expires_in: response.data.expires_in,
+        scope: response.data.scope,
+      };
+
+      // Calculate expiration timestamp
+      if (token.expires_in) {
+        token.expires_at = Date.now() + token.expires_in * 1000;
+      }
+
+      return token;
+    } catch (error: any) {
+      if (axios.isAxiosError(error)) {
+        const message = error.response?.data?.error_description ||
+                       error.response?.data?.error ||
+                       error.message;
+        throw new Error(`Token exchange failed: ${message}`);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Authenticate with OAuth server using browser flow
+   */
+  async authenticate(
+    serverName: string,
+    config: OAuthConfig
+  ): Promise<OAuthToken> {
+    const authUrl = this.buildAuthorizationUrl(config);
+
+    return new Promise((resolve, reject) => {
+      console.log(`\n🔐 Authenticating with ${serverName}...`);
+      console.log(`\n🌐 Opening browser to: ${authUrl}`);
+      console.log(`📝 After approving, you'll be redirected back.\n`);
+
+      // Start callback server
+      this.server = http.createServer(async (req, res) => {
+        const url = new URL(req.url!, `http://localhost:${this.port}`);
+
+        if (url.pathname === '/callback') {
+          const code = url.searchParams.get('code');
+          const error = url.searchParams.get('error');
+
+          if (code) {
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end(`
+              <html>
+                <body style="font-family: sans-serif; padding: 50px; text-align: center;">
+                  <h1>✅ Authentication Successful!</h1>
+                  <p>You can close this window and return to your terminal.</p>
+                  <p style="color: green; font-weight: bold;">Exchanging code for token...</p>
+                </body>
+              </html>
+            `);
+
+            // Close server
+            this.server?.close();
+
+            try {
+              // Exchange code for token
+              const token = await this.exchangeCodeForToken(code, config);
+              resolve(token);
+            } catch (err: any) {
+              reject(err);
+            }
+          } else {
+            res.writeHead(400, { 'Content-Type': 'text/html' });
+            res.end(`
+              <html>
+                <body style="font-family: sans-serif; padding: 50px; text-align: center;">
+                  <h1>❌ Authentication Failed</h1>
+                  <p>Error: ${error || 'Unknown error'}</p>
+                </body>
+              </html>
+            `);
+            this.server?.close();
+            reject(new Error(`OAuth failed: ${error}`));
+          }
+        }
+      });
+
+      this.server.listen(this.port, () => {
+        console.log(`🔗 Callback server listening on http://localhost:${this.port}`);
+
+        // Open browser
+        open.default(authUrl).catch(err => {
+          console.error('Failed to open browser:', err);
+          console.log('\n📋 Please open this URL manually:');
+          console.log(authUrl);
+        });
+      });
+
+      // Timeout after 5 minutes
+      setTimeout(() => {
+        if (this.server?.listening) {
+          this.server.close();
+          reject(new Error('OAuth timeout - took longer than 5 minutes'));
+        }
+      }, 5 * 60 * 1000);
+    });
+  }
+
+  /**
+   * Refresh an expired access token
+   */
+  async refreshToken(
+    refreshToken: string,
+    config: Pick<OAuthConfig, 'clientId' | 'clientSecret' | 'tokenEndpoint'>
+  ): Promise<OAuthToken> {
+    const params = new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: config.clientId,
+    });
+
+    if (config.clientSecret) {
+      params.append('client_secret', config.clientSecret);
     }
 
-    callbackResult = await callbackPromise;
+    try {
+      const response = await axios.post(config.tokenEndpoint, params, {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+      });
+
+      const token: OAuthToken = {
+        access_token: response.data.access_token,
+        refresh_token: response.data.refresh_token || refreshToken,
+        token_type: response.data.token_type || 'Bearer',
+        expires_in: response.data.expires_in,
+        scope: response.data.scope,
+      };
+
+      // Calculate expiration timestamp
+      if (token.expires_in) {
+        token.expires_at = Date.now() + token.expires_in * 1000;
+      }
+
+      return token;
+    } catch (error: any) {
+      if (axios.isAxiosError(error)) {
+        const message = error.response?.data?.error_description ||
+                       error.response?.data?.error ||
+                       error.message;
+        throw new Error(`Token refresh failed: ${message}`);
+      }
+      throw error;
+    }
   }
 
-  // CSRF check
-  if (callbackResult.state !== state) {
-    throw new Error('OAuth state mismatch — possible CSRF attack. Please try again.');
+  async authenticateManual(serverName: string): Promise<string> {
+    console.log(`\n📋 Manual OAuth Flow for ${serverName}`);
+    console.log('\n1. The MCP server will provide an OAuth URL');
+    console.log('2. Open it in your browser and approve');
+    console.log('3. Copy the full callback URL and paste it here\n');
+
+    // This would be implemented with readline
+    throw new Error('Manual flow not yet implemented - use browser flow');
   }
-
-  console.log(chalk.dim('\nExchanging authorization code for token...'));
-  const token = await exchangeCodeForToken(server, callbackResult.code, pkce, callbackPort);
-
-  await tokenManager.saveToken(serverName, token);
-
-  console.log(chalk.green(`\n✅ Authentication successful for '${serverName}'!`));
-  if (token.expires_in) {
-    const expiresIn = Math.round(token.expires_in / 60);
-    console.log(chalk.dim(`   Token expires in ${expiresIn} minutes (auto-refresh enabled)`));
-  }
-
-  return token;
 }
+
+export { OAuthConfig };

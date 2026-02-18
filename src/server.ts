@@ -1,171 +1,211 @@
 /**
- * Express HTTP server — the bridge API that remote MCP clients talk to.
- *
- * All routes (except /health) require a Bearer token that matches the
- * password configured in ~/.mcp-bridge/config.json.
+ * Express HTTP bridge server
  */
-import express, { Express, Request, Response, NextFunction } from 'express';
-import chalk from 'chalk';
+import express, { Request, Response, NextFunction } from 'express';
 import { BridgeConfig } from './types';
-import { ConfigManager } from './config';
-import { TokenManager } from './tokens';
 import { MCPClient } from './mcp-client';
 
-// --- Auth middleware ---
+interface AuthRequest extends Request {
+  authenticated?: boolean;
+}
 
-function authMiddleware(config: BridgeConfig) {
-  return (req: Request, res: Response, next: NextFunction): void => {
+export class BridgeServer {
+  private app: express.Application;
+  private config: BridgeConfig;
+  private mcpClient: MCPClient;
+  private server: any = null;
+
+  constructor(config: BridgeConfig, mcpClient: MCPClient) {
+    this.config = config;
+    this.mcpClient = mcpClient;
+    this.app = express();
+    this.setupMiddleware();
+    this.setupRoutes();
+  }
+
+  /**
+   * Setup Express middleware
+   */
+  private setupMiddleware(): void {
+    // Parse JSON bodies
+    this.app.use(express.json());
+
+    // Request logging
+    this.app.use((req: Request, res: Response, next: NextFunction) => {
+      console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
+      next();
+    });
+  }
+
+  /**
+   * Authentication middleware
+   */
+  private authMiddleware(req: AuthRequest, res: Response, next: NextFunction): void {
     const authHeader = req.headers.authorization;
 
-    if (!authHeader?.startsWith('Bearer ')) {
-      res.status(401).json({ error: 'Missing or malformed Authorization header. Use: Bearer <password>' });
-      return;
-    }
-
-    const provided = authHeader.slice(7);
-    const expected = config.auth.password ?? config.auth.token;
-
-    if (!expected || provided !== expected) {
-      res.status(401).json({ error: 'Invalid credentials' });
-      return;
-    }
-
-    next();
-  };
-}
-
-// --- App factory ---
-
-/**
- * Creates and configures the Express app without starting it.
- * Separated from startServer to make routes independently testable.
- */
-export function createApp(
-  config: BridgeConfig,
-  configManager: ConfigManager,
-  tokenManager: TokenManager,
-  mcpClient: MCPClient
-): Express {
-  const app = express();
-  app.use(express.json());
-
-  // Health check — no auth required
-  app.get('/health', (_req: Request, res: Response) => {
-    res.json({
-      status: 'ok',
-      servers: Object.keys(config.servers).length,
-    });
-  });
-
-  // Apply auth to all routes below
-  app.use(authMiddleware(config));
-
-  // List configured servers with token status
-  app.get('/servers', async (_req: Request, res: Response) => {
-    try {
-      const servers: Record<string, { url: string; hasToken: boolean; tokenExpired: boolean | null }> = {};
-
-      for (const [name, server] of Object.entries(config.servers)) {
-        const token = await tokenManager.loadToken(name);
-        servers[name] = {
-          url: server.url,
-          hasToken: token !== null,
-          tokenExpired: token ? tokenManager.isExpired(token) : null,
-        };
-      }
-
-      res.json({ servers });
-    } catch (err) {
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  });
-
-  // List tools for a specific MCP server
-  app.get('/mcp/:server/tools', async (req: Request, res: Response) => {
-    const serverName = req.params.server;
-    const server = config.servers[serverName];
-
-    if (!server) {
-      res.status(404).json({ error: `Server '${serverName}' not found. Run: mcp-oauth-bridge list` });
-      return;
-    }
-
-    try {
-      const tools = await mcpClient.listTools(serverName, server);
-      res.json({ tools });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      const isAuthError = message.includes('Authentication rejected') || message.includes('invalid or revoked');
-      res.status(isAuthError ? 401 : 502).json({ error: message });
-    }
-  });
-
-  // Call a tool on a specific MCP server
-  app.post('/mcp/:server/call', async (req: Request, res: Response) => {
-    const serverName = req.params.server;
-    const server = config.servers[serverName];
-
-    if (!server) {
-      res.status(404).json({ error: `Server '${serverName}' not found. Run: mcp-oauth-bridge list` });
-      return;
-    }
-
-    const { tool, arguments: args } = req.body as { tool?: string; arguments?: Record<string, unknown> };
-
-    if (!tool) {
-      res.status(400).json({ error: 'Request body must include "tool" field' });
-      return;
-    }
-
-    try {
-      const result = await mcpClient.callTool(serverName, server, {
-        tool,
-        arguments: args ?? {},
+    if (!authHeader) {
+      res.status(401).json({
+        error: 'Missing Authorization header',
+        code: 401,
       });
-      res.json(result);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      const isAuthError = message.includes('Authentication rejected') || message.includes('invalid or revoked');
-      res.status(isAuthError ? 401 : 502).json({ error: message });
+      return;
     }
-  });
 
-  return app;
-}
+    const expectedAuth = `Bearer ${this.config.auth.password || this.config.auth.token}`;
 
-// --- Server startup ---
+    if (authHeader !== expectedAuth) {
+      res.status(401).json({
+        error: 'Invalid authorization token',
+        code: 401,
+      });
+      return;
+    }
 
-export async function startServer(
-  configManager: ConfigManager,
-  overrides: { port?: number; host?: string } = {}
-): Promise<void> {
-  const config = await configManager.load();
-  const port = overrides.port ?? config.port;
-  const host = overrides.host ?? config.host;
+    req.authenticated = true;
+    next();
+  }
 
-  const tokenManager = new TokenManager(configManager);
-  const mcpClient = new MCPClient(tokenManager);
-  const app = createApp(config, configManager, tokenManager, mcpClient);
-
-  await new Promise<void>((resolve, reject) => {
-    const httpServer = app.listen(port, host, () => {
-      console.log(chalk.green(`\n✅ MCP OAuth Bridge running at http://${host}:${port}`));
-      console.log(chalk.dim(`   Servers: ${Object.keys(config.servers).join(', ') || 'none configured'}`));
-      console.log(chalk.dim(`   API key: ${config.auth.password ?? config.auth.token}`));
-      console.log(chalk.dim('\nEndpoints:'));
-      console.log(chalk.dim(`   GET  http://${host}:${port}/health`));
-      console.log(chalk.dim(`   GET  http://${host}:${port}/servers`));
-      console.log(chalk.dim(`   GET  http://${host}:${port}/mcp/:server/tools`));
-      console.log(chalk.dim(`   POST http://${host}:${port}/mcp/:server/call`));
-      resolve();
+  /**
+   * Setup Express routes
+   */
+  private setupRoutes(): void {
+    // Health check (no auth required)
+    this.app.get('/health', (req: Request, res: Response) => {
+      res.json({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        version: '0.1.0',
+      });
     });
 
-    httpServer.on('error', (err: NodeJS.ErrnoException) => {
-      if (err.code === 'EADDRINUSE') {
-        reject(new Error(`Port ${port} is already in use. Use --port to choose a different port.`));
-      } else {
-        reject(err);
+    // List configured servers (requires auth)
+    this.app.get('/servers', this.authMiddleware.bind(this), async (req: Request, res: Response) => {
+      try {
+        const servers = Object.keys(this.config.servers);
+        res.json({ servers });
+      } catch (error: any) {
+        res.status(500).json({
+          error: error.message,
+          code: 500,
+        });
       }
     });
-  });
+
+    // List tools for a server (requires auth)
+    this.app.get('/mcp/:server/tools', this.authMiddleware.bind(this), async (req: Request, res: Response) => {
+      try {
+        const serverName = req.params.server;
+        const tools = await this.mcpClient.listTools(serverName);
+        res.json({ tools });
+      } catch (error: any) {
+        const statusCode = error.message.includes('not found') ? 404 :
+                          error.message.includes('Authentication failed') ? 401 : 500;
+        res.status(statusCode).json({
+          error: error.message,
+          code: statusCode,
+        });
+      }
+    });
+
+    // Call tool on server (requires auth)
+    this.app.post('/mcp/:server/call', this.authMiddleware.bind(this), async (req: Request, res: Response) => {
+      try {
+        const serverName = req.params.server;
+        const { tool, arguments: args } = req.body;
+
+        if (!tool) {
+          res.status(400).json({
+            error: 'Missing required field: tool',
+            code: 400,
+          });
+          return;
+        }
+
+        const result = await this.mcpClient.callTool(serverName, tool, args || {});
+
+        if (result.isError) {
+          res.status(500).json({
+            error: result.content[0]?.text || 'Tool execution failed',
+            code: 500,
+            result,
+          });
+        } else {
+          res.json({ result });
+        }
+      } catch (error: any) {
+        const statusCode = error.message.includes('not found') ? 404 :
+                          error.message.includes('Authentication failed') ? 401 : 500;
+        res.status(statusCode).json({
+          error: error.message,
+          code: statusCode,
+        });
+      }
+    });
+
+    // 404 handler
+    this.app.use((req: Request, res: Response) => {
+      res.status(404).json({
+        error: 'Not found',
+        code: 404,
+        path: req.path,
+      });
+    });
+
+    // Error handler
+    this.app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+      console.error('Unhandled error:', err);
+      res.status(500).json({
+        error: 'Internal server error',
+        code: 500,
+        message: err.message,
+      });
+    });
+  }
+
+  /**
+   * Start the server
+   */
+  async start(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      try {
+        this.server = this.app.listen(this.config.port, this.config.host, () => {
+          console.log(`\n🚀 MCP OAuth Bridge running on http://${this.config.host}:${this.config.port}`);
+          console.log(`\n📋 Available routes:`);
+          console.log(`   GET  /health              - Health check (no auth)`);
+          console.log(`   GET  /servers             - List servers (auth required)`);
+          console.log(`   GET  /mcp/:server/tools   - List tools (auth required)`);
+          console.log(`   POST /mcp/:server/call    - Call tool (auth required)`);
+          console.log(`\n🔑 Use Authorization header: Bearer ${this.config.auth.password || this.config.auth.token}`);
+          console.log(`\n Press Ctrl+C to stop\n`);
+          resolve();
+        });
+
+        this.server.on('error', (err: Error) => {
+          reject(err);
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  /**
+   * Stop the server
+   */
+  async stop(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (this.server) {
+        this.server.close((err: Error) => {
+          if (err) {
+            reject(err);
+          } else {
+            console.log('\n👋 Server stopped');
+            resolve();
+          }
+        });
+      } else {
+        resolve();
+      }
+    });
+  }
 }

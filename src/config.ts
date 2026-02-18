@@ -4,7 +4,7 @@
 import * as fs from 'fs-extra';
 import * as path from 'path';
 import * as os from 'os';
-import { BridgeConfig, MCPServer, OAuthConfig } from './types';
+import { BridgeConfig, MCPServer } from './types';
 
 const DEFAULT_CONFIG_DIR = path.join(os.homedir(), '.mcp-bridge');
 const CONFIG_FILE = 'config.json';
@@ -48,7 +48,7 @@ export class ConfigManager {
 
   async load(): Promise<BridgeConfig> {
     if (this.config) return this.config;
-
+    
     if (!await fs.pathExists(this.configPath)) {
       throw new Error('Config not found. Run: mcp-oauth-bridge init');
     }
@@ -62,29 +62,20 @@ export class ConfigManager {
     this.config = config;
   }
 
-  async addServer(
-    name: string,
-    url: string,
-    oauthOptions?: {
-      authorizationUrl?: string;
-      tokenUrl?: string;
-      clientId?: string;
-      clientSecret?: string;
-      scopes?: string[];
-    }
-  ): Promise<void> {
+  async addServer(name: string, url: string): Promise<void> {
     const config = await this.load();
-
+    
     if (config.servers[name]) {
       throw new Error(`Server '${name}' already exists`);
     }
 
-    const oauth: OAuthConfig = {
-      tokenPath: this.getTokenPath(name),
-      ...oauthOptions
+    config.servers[name] = {
+      name,
+      url,
+      oauth: {
+        tokenPath: path.join(this.tokensDir, `${name}.json`)
+      }
     };
-
-    config.servers[name] = { name, url, oauth };
 
     await this.save(config);
     console.log(`✅ Added server: ${name}`);
@@ -92,15 +83,15 @@ export class ConfigManager {
 
   async removeServer(name: string): Promise<void> {
     const config = await this.load();
-
+    
     if (!config.servers[name]) {
       throw new Error(`Server '${name}' not found`);
     }
 
     delete config.servers[name];
-
+    
     // Remove token file
-    const tokenPath = this.getTokenPath(name);
+    const tokenPath = path.join(this.tokensDir, `${name}.json`);
     if (await fs.pathExists(tokenPath)) {
       await fs.remove(tokenPath);
     }
@@ -117,7 +108,7 @@ export class ConfigManager {
   async getServer(name: string): Promise<MCPServer> {
     const config = await this.load();
     const server = config.servers[name];
-
+    
     if (!server) {
       throw new Error(`Server '${name}' not found`);
     }
@@ -134,7 +125,7 @@ export class ConfigManager {
   }
 
   private generatePassword(): string {
-    return Math.random().toString(36).slice(2) +
+    return Math.random().toString(36).slice(2) + 
            Math.random().toString(36).slice(2);
   }
 }
