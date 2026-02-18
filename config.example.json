@@ -1,0 +1,19 @@
+{
+  "port": 3000,
+  "host": "localhost",
+  "auth": {
+    "type": "password",
+    "password": "YOUR_GENERATED_PASSWORD_HERE"
+  },
+  "servers": {
+    "granola": {
+      "name": "granola",
+      "url": "https://mcp.granola.ai/mcp",
+      "oauth": {
+        "clientId": "client_YOUR_CLIENT_ID_HERE",
+        "tokenPath": "/Users/you/.mcp-bridge/tokens/granola.json"
+      }
+    }
+  },
+  "dataDir": "/Users/you/.mcp-bridge"
+}

@@ -59,6 +59,7 @@ export class MCPClient {
           headers: {
             'Authorization': `Bearer ${token.access_token}`,
             'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
           },
           timeout: 30000,
         }
@@ -109,6 +110,7 @@ export class MCPClient {
           headers: {
             'Authorization': `Bearer ${token.access_token}`,
             'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
           },
           timeout: 60000, // Tool calls may take longer
         }

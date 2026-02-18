@@ -1,0 +1,20 @@
+[Unit]
+Description=MCP OAuth Bridge
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/mcp-oauth-bridge
+ExecStart=/usr/bin/node /root/mcp-oauth-bridge/dist/cli.js start --host 127.0.0.1 --port 3000
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
